@@ -1,42 +1,66 @@
-import { App, Menu, MenuItem, Plugin, Modal, requestUrl, TFile, moment } from 'obsidian';
+import { Menu, MenuItem, Plugin, TFile, moment } from 'obsidian';
 import { DEFAULT_SETTINGS, DiscourseSyncSettings, DiscourseSyncSettingsTab } from './config';
 import * as yaml from 'yaml';
 import { t, setLocale } from './i18n';
+import { expandEmbeds } from './expand-embeds';
+import { DiscourseAPI } from './api';
+import { EmbedHandler } from './embed-handler';
+import { SelectCategoryModal } from './ui';
+import { NotifyUser } from './notification';
+import { getFrontMatter, removeFrontMatter } from './utils';
+import { ActiveFile, PluginInterface } from './types';
 
-export default class DiscourseSyncPlugin extends Plugin {
+export default class PublishToDiscourse extends Plugin implements PluginInterface {
 	settings: DiscourseSyncSettings;
-	activeFile: { 
-		name: string; 
-		content: string;
-		postId?: number; // Post ID field
-	};
+	activeFile: ActiveFile;
+	api: DiscourseAPI;
+	embedHandler: EmbedHandler;
+
 	async onload() {
-		// Set locale based on Obsidian's language setting
+		// 设置语言
 		setLocale(moment.locale());
 
-		// Update locale when Obsidian's language changes
+		// 当Obsidian语言变化时更新语言
 		this.registerEvent(
 			this.app.workspace.on('window-open', () => {
 				setLocale(moment.locale());
 			})
 		);
 
+		// 加载设置
 		await this.loadSettings();
+		
+		// 初始化API和嵌入处理器
+		this.api = new DiscourseAPI(this.app, this.settings);
+		this.embedHandler = new EmbedHandler(this.app, this.api);
+		
+		// 添加设置选项卡
 		this.addSettingTab(new DiscourseSyncSettingsTab(this.app, this));
+		
+		// 注册文件菜单
 		this.registerEvent(
 			this.app.workspace.on("file-menu", (menu, file: TFile) => {
 				this.registerDirMenu(menu, file);
 			}),
 		);
 
+		// 添加发布命令
 		this.addCommand({
-			id: "category-modal",
+			id: "publish-to-discourse",
 			name: t('PUBLISH_TO_DISCOURSE'),
 			callback: () => {
-				this.openCategoryModal();
+				this.publishToDiscourse();
 			},
 		});
 
+		// 添加在浏览器中打开帖子的命令
+		this.addCommand({
+			id: "open-in-discourse",
+			name: t('OPEN_IN_DISCOURSE'),
+			callback: () => {
+				this.openInDiscourse();
+			},
+		});
 	}
 
 	async loadSettings() {
@@ -47,675 +71,235 @@ export default class DiscourseSyncPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	extractImageReferences(content: string): string[] {
-		const regex = /!\[\[(.*?)\]\]/g;
-		const matches = [];
-		let match;
-		while ((match = regex.exec(content)) !== null) {
-			matches.push(match[1]);
-		}
-		return matches;
-	}
-
-	async uploadImages(imageReferences: string[]): Promise<string[]> {
-		const imageUrls: string[] = [];
-		for (const ref of imageReferences) {
-			const filePath = this.app.metadataCache.getFirstLinkpathDest(ref, this.activeFile.name)?.path;
-			if (filePath) {
-				const abstractFile = this.app.vault.getAbstractFileByPath(filePath);
-				if (abstractFile instanceof TFile) {
-					try {
-						const imgfile = await this.app.vault.readBinary(abstractFile);
-						const boundary = genBoundary();
-						const sBoundary = '--' + boundary + '\r\n';
-						const imgForm = `${sBoundary}Content-Disposition: form-data; name="file"; filename="${abstractFile.name}"\r\nContent-Type: image/${abstractFile.extension}\r\n\r\n`;
-
-
-						let body = '';
-						body += `\r\n${sBoundary}Content-Disposition: form-data; name="type"\r\n\r\ncomposer\r\n`;
-						body += `${sBoundary}Content-Disposition: form-data; name="synchronous"\r\n\r\ntrue\r\n`;
-
-						const eBoundary = '\r\n--' + boundary + '--\r\n';
-						const imgFormArray = new TextEncoder().encode(imgForm);
-						const bodyArray = new TextEncoder().encode(body);
-						const endBoundaryArray = new TextEncoder().encode(eBoundary);
-
-						const formDataArray = new Uint8Array(imgFormArray.length + imgfile.byteLength + bodyArray.length + endBoundaryArray.length);
-						formDataArray.set(imgFormArray, 0);
-						formDataArray.set(new Uint8Array(imgfile), imgFormArray.length);
-						formDataArray.set(bodyArray, imgFormArray.length + imgfile.byteLength);
-						formDataArray.set(endBoundaryArray, imgFormArray.length + bodyArray.length + imgfile.byteLength);
-
-						const url = `${this.settings.baseUrl}/uploads.json`;
-						const headers = {
-							"Api-Key": this.settings.apiKey,
-							"Api-Username": this.settings.disUser,
-							"Content-Type": `multipart/form-data; boundary=${boundary}`,
-						};
-
-						const response = await requestUrl({
-							url: url,
-							method: "POST",
-							body: formDataArray.buffer,
-							throw: false,
-							headers: headers,
-						});
-
-						if (response.status == 200) {
-							const jsonResponse = response.json;
-							imageUrls.push(jsonResponse.short_url);
-						} else {
-							new NotifyUser(this.app, `Error uploading image: ${response.status}`).open();
-						}
-					} catch (error) {
-						new NotifyUser(this.app, `Exception while uploading image: ${error}`).open();
-					}
-				} else {
-					new NotifyUser(this.app, `File not found in vault: ${ref}`).open();
-				}
-			} else {
-				new NotifyUser(this.app, `Unable to resolve file path for: ${ref}`).open();
-			}
-		}
-		return imageUrls;
-	}
-
-	async postTopic(): Promise<{ message: string; error?: string }> {
-		const url = `${this.settings.baseUrl}/posts.json`;
-		const headers = {
-			"Content-Type": "application/json",
-			"Api-Key": this.settings.apiKey,
-			"Api-Username": this.settings.disUser,
-		}
-		let content = this.activeFile.content;
-
-		// Check if frontmatter contains post ID
-		const frontMatter = this.getFrontMatter(content);
-		const postId = frontMatter?.discourse_post_id;
-		
-		// Filter out note properties section
-		content = content.replace(/^---[\s\S]*?---\n/, '');
-
-		const imageReferences = this.extractImageReferences(content);
-		const imageUrls = await this.uploadImages(imageReferences);
-
-		imageReferences.forEach((ref, index) => {
-			const obsRef = `![[${ref}]]`;
-			const discoRef = `![${ref}](${imageUrls[index]})`;
-			content = content.replace(obsRef, discoRef);
-		});
-
-		const isUpdate = postId !== undefined;
-		const endpoint = isUpdate ? `${this.settings.baseUrl}/posts/${postId}` : url;
-		const method = isUpdate ? "PUT" : "POST";
-
-		const body = JSON.stringify(isUpdate ? {
-			raw: content,
-			edit_reason: "Updated from Obsidian",
-			tags: this.settings.selectedTags || []
-		} : {
-			title: this.activeFile.name,
-			raw: content,
-			category: this.settings.category,
-			tags: this.settings.selectedTags || []
-		});
-
-		try {
-			const response = await requestUrl({
-				url: endpoint,
-				method: method,
-				contentType: "application/json",
-				body,
-				headers,
-				throw: false
+	// 注册目录菜单
+	registerDirMenu(menu: Menu, file: TFile) {
+		const syncDiscourse = (item: MenuItem) => {
+			item.setTitle(t('PUBLISH_TO_DISCOURSE'));
+			item.onClick(async () => {
+				await this.publishToDiscourse(file);
 			});
+		}
+		menu.addItem(syncDiscourse)
+	}
 
-			if (response.status === 200) {
-				if (!isUpdate) {
-					try {
-						// Get new post ID
-						const responseData = response.json;
-						if (responseData && responseData.id) {
-							await this.updateFrontMatter(responseData.id);
-						} else {
-							return {
-								message: "Error",
-								error: t('POST_ID_ERROR')
-							};
-						}
-					} catch (error) {
-						return {
-							message: "Error",
-							error: t('SAVE_POST_ID_ERROR')
-						};
+	// 同步到Discourse - 统一入口点
+	private async publishToDiscourse(file?: TFile) {
+		// 如果提供了特定文件，使用该文件；否则使用当前活动文件
+		const targetFile = file || this.app.workspace.getActiveFile();
+		if (!targetFile) {
+			new NotifyUser(this.app, t('NO_ACTIVE_FILE')).open();
+			return;
+		}
+		
+		// 使用expandEmbeds处理嵌入内容
+		const content = await expandEmbeds(this.app, targetFile);
+		const fm = getFrontMatter(content);
+		const postId = fm?.discourse_post_id;
+		const topicId = fm?.discourse_topic_id;
+		const isUpdate = postId !== undefined && topicId !== undefined;
+		
+		// 初始化activeFile对象
+		this.activeFile = {
+			name: targetFile.basename,
+			content: content,
+			postId: postId,
+			// 从frontmatter中获取标签，如果没有则使用空数组
+			tags: fm?.discourse_tags || []
+		};
+		
+		// 获取分类和标签列表
+		const [categories, tags] = await Promise.all([
+			this.api.fetchCategories(),
+			this.api.fetchTags()
+		]);
+		
+		// 如果是更新帖子，先从Discourse获取最新标签和分类
+		if (isUpdate) {
+			try {
+				const topicInfo = await this.api.fetchTopicInfo(topicId);
+				
+				// 用Discourse上的标签覆盖本地标签
+				if (topicInfo.tags.length > 0) {
+					this.activeFile.tags = topicInfo.tags;
+					console.log(`Updated tags from Discourse: ${topicInfo.tags.join(', ')}`);
+				}
+				
+				// 如果获取到了分类ID，更新设置中的分类
+				if (topicInfo.categoryId) {
+					// 查找分类名称
+					const category = categories.find(c => c.id === topicInfo.categoryId);
+					if (category) {
+						this.settings.category = category.id;
+						console.log(`Updated category from Discourse: ${category.name} (${category.id})`);
 					}
 				}
-				return { message: "Success" };
+			} catch (error) {
+				console.error("Failed to fetch topic info from Discourse:", error);
+				// 如果获取失败，继续使用本地标签和分类
+			}
+		}
+		
+		if (categories.length > 0) {
+			new SelectCategoryModal(this.app, this, categories, tags).open();
+		}
+	}
+
+	// 在Discourse中打开
+	private async openInDiscourse() {
+		const activeFile = this.app.workspace.getActiveFile();
+		if (!activeFile) {
+			new NotifyUser(this.app, t('NO_ACTIVE_FILE')).open();
+			return;
+		}
+
+		const content = await this.app.vault.read(activeFile);
+		const fm = getFrontMatter(content);
+		const discourseUrl = fm?.discourse_url;
+		const topicId = fm?.discourse_topic_id;
+
+		if (!discourseUrl && !topicId) {
+			new NotifyUser(this.app, t('NO_TOPIC_ID')).open();
+			return;
+		}
+
+		const url = discourseUrl || `${this.settings.baseUrl}/t/${topicId}`;
+		window.open(url, '_blank');
+	}
+
+	// 发布主题
+	async publishTopic(): Promise<{ success: boolean; error?: string }> {
+		let content = this.activeFile.content;
+		
+		// 移除Front Matter
+		content = removeFrontMatter(content);
+
+		// 提取嵌入引用
+		const embedReferences = this.embedHandler.extractEmbedReferences(content);
+		
+		// 处理嵌入内容
+		const uploadedUrls = await this.embedHandler.processEmbeds(embedReferences, this.activeFile.name);
+		
+		// 替换嵌入引用为Markdown格式
+		content = this.embedHandler.replaceEmbedReferences(content, embedReferences, uploadedUrls);
+
+		// 如果启用了"跳过一级标题"选项，则删除所有H1标题
+		if (this.settings.skipH1) {
+			// 匹配Markdown中的所有H1标题（# 标题）
+			content = content.replace(/^\s*# [^\n]+\n?/gm, '');
+		}
+
+		// 获取Front Matter
+		const frontMatter = getFrontMatter(this.activeFile.content);
+		const postId = frontMatter?.discourse_post_id;
+		const topicId = frontMatter?.discourse_topic_id;
+		const isUpdate = postId !== undefined;
+		
+		// 获取当前选择的标签
+		const currentTags = this.activeFile.tags || [];
+		
+		// 发布或更新帖子
+		let result;
+		try {
+			if (isUpdate) {
+				// 更新帖子
+				result = await this.api.updatePost(
+					postId,
+					topicId,
+					(frontMatter?.title ? frontMatter?.title : this.activeFile.name),
+					content,
+					this.settings.category,
+					currentTags
+				);
+				
+				// 如果更新成功，更新Front Matter
+				if (result.success) {
+					await this.updateFrontMatter(postId, topicId, currentTags);
+				}
 			} else {
-				try {
-					const errorResponse = response.json;
-					if (errorResponse.errors && errorResponse.errors.length > 0) {
-						return { 
-							message: "Error",
-							error: errorResponse.errors.join('\n')
-						};
-					}
-					if (errorResponse.error) {
-						return {
-							message: "Error",
-							error: errorResponse.error
-						};
-					}
-				} catch (parseError) {
-					return {
-						message: "Error",
-						error: `${isUpdate ? t('UPDATE_FAILED') : t('PUBLISH_FAILED')} (${response.status})`
-					};
+				// 创建新帖子
+				result = await this.api.createPost(
+					(frontMatter?.title ? frontMatter?.title : this.activeFile.name),
+					content,
+					this.settings.category,
+					currentTags
+				);
+				
+				// 如果创建成功，更新Front Matter
+				if (result.success && result.postId && result.topicId) {
+					await this.updateFrontMatter(result.postId, result.topicId, currentTags);
 				}
 			}
+			
+			// 返回结果
+			return result;
 		} catch (error) {
-			return { 
-				message: "Error",
-				error: `${isUpdate ? t('UPDATE_FAILED') : t('PUBLISH_FAILED')}: ${error.message || t('UNKNOWN_ERROR')}`
+			// 返回错误
+			return {
+				success: false,
+				error: error.message || t('UNKNOWN_ERROR')
 			};
 		}
-		return { message: "Error", error: `${isUpdate ? t('UPDATE_FAILED') : t('PUBLISH_FAILED')}, ${t('TRY_AGAIN')}` };
 	}
 
-	// Get frontmatter data
-	private getFrontMatter(content: string): any {
-		const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
-		if (fmMatch) {
-			try {
-				return yaml.parse(fmMatch[1]);
-			} catch (e) {
-				return null;
-			}
-		}
-		return null;
-	}
-
-	// Update frontmatter, add post ID
-	private async updateFrontMatter(postId: number) {
+	// 更新Front Matter
+	private async updateFrontMatter(postId: number, topicId: number, tags: string[]) {
 		try {
-			// Get current active file
+			// 获取当前活动文件
 			const activeFile = this.app.workspace.getActiveFile();
 			if (!activeFile) {
 				return;
 			}
 
 			const content = await this.app.vault.read(activeFile);
-			const fm = this.getFrontMatter(content);
+			const fm = getFrontMatter(content);
+			const discourseUrl = `${this.settings.baseUrl}/t/${topicId}`;
+			
+			// 获取当前分类信息
+			const categoryId = this.settings.category;
+			// 查找分类名称
+			const categories = await this.api.fetchCategories();
+			const category = categories.find(c => c.id === categoryId);
+			const categoryName = category ? category.name : '';
 			
 			let newContent: string;
 			if (fm) {
-				// Update existing frontmatter
-				const updatedFm = { ...fm, discourse_post_id: postId };
+				// 更新现有Front Matter
+				const updatedFm = { 
+					...fm, 
+					discourse_post_id: postId, 
+					discourse_topic_id: topicId,
+					discourse_url: discourseUrl,
+					discourse_tags: tags,
+					discourse_category_id: categoryId,
+					discourse_category: categoryName
+				};
 				newContent = content.replace(/^---\n[\s\S]*?\n---\n/, `---\n${yaml.stringify(updatedFm)}---\n`);
 			} else {
-				// Add new frontmatter
-				const newFm = { discourse_post_id: postId };
+				// 添加新Front Matter
+				const newFm = { 
+					discourse_post_id: postId, 
+					discourse_topic_id: topicId,
+					discourse_url: discourseUrl,
+					discourse_tags: tags,
+					discourse_category_id: categoryId,
+					discourse_category: categoryName
+				};
 				newContent = `---\n${yaml.stringify(newFm)}---\n${content}`;
 			}
 			
 			await this.app.vault.modify(activeFile, newContent);
-		} catch (error) {
-			return {
-				message: "Error",
-				error: t('UPDATE_FAILED')
+			// 更新activeFile对象
+			this.activeFile = {
+				name: activeFile.basename,
+				content: newContent,
+				postId: postId,
+				tags: tags
 			};
-		}
-	}
-
-	private async fetchCategories() {
-		const url = `${this.settings.baseUrl}/categories.json?include_subcategories=true`;
-		const headers = {
-			"Content-Type": "application/json",
-			"Api-Key": this.settings.apiKey,
-			"Api-Username": this.settings.disUser,
-		};
-
-		try {
-			const response = await requestUrl({
-				url: url,
-				method: "GET",
-				contentType: "application/json",
-				headers,
-			});
-
-
-			const data = await response.json;
-			const categories = data.category_list.categories;
-			const allCategories = categories.flatMap((category: Category) => {
-				const subcategories: { id: number; name: string }[] = category.subcategory_list?.map((sub: Subcategory) => ({
-					id: sub.id,
-					name: sub.name,
-				})) || [];
-				return [
-					{ id: category.id, name: category.name },
-					...subcategories,
-				];
-			});
-			return allCategories;
 		} catch (error) {
-			return [];
+			new NotifyUser(this.app, t('UPDATE_FAILED')).open();
 		}
-	}
-
-	private async fetchTags(): Promise<{ name: string; canCreate: boolean }[]> {
-		const url = `${this.settings.baseUrl}/tags.json`;
-		const headers = {
-			"Content-Type": "application/json",
-			"Api-Key": this.settings.apiKey,
-			"Api-Username": this.settings.disUser,
-		};
-
-		try {
-			const response = await requestUrl({
-				url: url,
-				method: "GET",
-				contentType: "application/json",
-				headers,
-			});
-
-			if (response.status === 200) {
-				const data = response.json;
-				// Get user permissions
-				const canCreateTags = await this.checkCanCreateTags();
-				// Tags list returned by Discourse is in the tags array
-				return data.tags.map((tag: any) => ({
-					name: tag.name,
-					canCreate: canCreateTags
-				}));
-			}
-			return [];
-		} catch (error) {
-			return [];
-		}
-	}
-
-	// Check if user has permission to create tags
-	private async checkCanCreateTags(): Promise<boolean> {
-		try {
-			const url = `${this.settings.baseUrl}/u/${this.settings.disUser}.json`;
-			const headers = {
-				"Content-Type": "application/json",
-				"Api-Key": this.settings.apiKey,
-				"Api-Username": this.settings.disUser,
-			};
-
-			const response = await requestUrl({
-				url: url,
-				method: "GET",
-				contentType: "application/json",
-				headers,
-			});
-
-			if (response.status === 200) {
-				const data = response.json;
-				// Check user's trust_level
-				return data.user.trust_level >= 3;
-			}
-			return false;
-		} catch (error) {
-			return false;
-		}
-	}
-
-	registerDirMenu(menu: Menu, file: TFile) {
-		const syncDiscourse = (item: MenuItem) => {
-			item.setTitle(t('PUBLISH_TO_DISCOURSE'));
-			item.onClick(async () => {
-				const content = await this.app.vault.read(file);
-				const fm = this.getFrontMatter(content);
-				this.activeFile = {
-					name: file.basename,
-					content: content,
-					postId: fm?.discourse_post_id
-				};
-				await this.syncToDiscourse();
-			});
-		}
-		menu.addItem(syncDiscourse)
-	}
-
-	private async openCategoryModal() {
-		const [categories, tags] = await Promise.all([
-			this.fetchCategories(),
-			this.fetchTags()
-		]);
-		if (categories.length > 0) {
-			new SelectCategoryModal(this.app, this, categories, tags).open();
-		}
-	}
-
-	private async syncToDiscourse() {
-		await this.openCategoryModal();
 	}
 
 	onunload() {}
-
 }
 
-interface Subcategory {
-	id: number;
-	name: string;
-}
-
-interface Category {
-	id: number;
-	name: string;
-	subcategory_list?: Subcategory[];
-}
-
-const genBoundary = (): string => {
-	return '----WebKitFormBoundary' + Math.random().toString(36).substring(2, 15);
-}
-
-
-export class NotifyUser extends Modal {
-	message: string;
-	constructor(app: App, message: string) {
-		super(app);
-		this.message = message;
-	}
-
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.createEl("h1", { text: 'An error has occurred.' });
-		contentEl.createEl("h4", { text: this.message });
-		const okButton = contentEl.createEl('button', { text: 'Ok' });
-		okButton.onclick = () => {
-			this.close();
-		}
-	}
-
-	onClose() {
-		const { contentEl } = this;
-		contentEl.empty();
-	}
-
-}
-
-export class SelectCategoryModal extends Modal {
-	plugin: DiscourseSyncPlugin;
-	categories: {id: number; name: string}[];
-	tags: { name: string; canCreate: boolean }[];
-	canCreateTags = false;
-
-	constructor(app: App, plugin: DiscourseSyncPlugin, categories: {id: number; name: string }[], tags: { name: string; canCreate: boolean }[]) {
-		super(app);
-		this.plugin = plugin;
-		this.categories = categories;
-		this.tags = tags;
-		this.canCreateTags = tags.length > 0 ? tags[0].canCreate : false;
-	}
-
-	onOpen() {
-		// Add modal base style
-		this.modalEl.addClass('mod-discourse-sync');
-		const { contentEl } = this;
-		contentEl.empty();
-		contentEl.addClass('discourse-sync-modal');
-
-		const isUpdate = this.plugin.activeFile.postId !== undefined;
-		contentEl.createEl("h1", { text: isUpdate ? t('UPDATE_POST') : t('PUBLISH_TO_DISCOURSE') });
-		
-		// Create form area container
-		const formArea = contentEl.createEl('div', { cls: 'form-area' });
-		
-		// Create selector container
-		const selectContainer = formArea.createEl('div', { cls: 'select-container' });
-		if (!isUpdate) {
-			// Only show category selector when creating a new post
-			selectContainer.createEl('label', { text: t('CATEGORY') });
-			const selectEl = selectContainer.createEl('select');
-			this.categories.forEach(category => {
-				const option = selectEl.createEl('option', { text: category.name });
-				option.value = category.id.toString();
-			});
-		}
-
-		// Create tag selector container
-		const tagContainer = formArea.createEl('div', { cls: 'tag-container' });
-		tagContainer.createEl('label', { text: t('TAGS') });
-		
-		// Create tag selector area
-		const tagSelectArea = tagContainer.createEl('div', { cls: 'tag-select-area' });
-		
-		// Selected tags display area
-		const selectedTagsContainer = tagSelectArea.createEl('div', { cls: 'selected-tags' });
-		const selectedTags = new Set<string>();
-
-		// Update selected tags display
-		const updateSelectedTags = () => {
-			selectedTagsContainer.empty();
-			selectedTags.forEach(tag => {
-				const tagEl = selectedTagsContainer.createEl('span', { 
-					cls: 'tag',
-					text: tag
-				});
-				const removeBtn = tagEl.createEl('span', {
-					cls: 'remove-tag',
-					text: '×'
-				});
-				removeBtn.onclick = () => {
-					selectedTags.delete(tag);
-					updateSelectedTags();
-				};
-			});
-		};
-
-		// Create tag input container
-		const tagInputContainer = tagSelectArea.createEl('div', { cls: 'tag-input-container' });
-		
-		// Create tag input and suggestions
-		const tagInput = tagInputContainer.createEl('input', {
-			type: 'text',
-			placeholder: this.canCreateTags ? t('ENTER_TAG_WITH_CREATE') : t('ENTER_TAG')
-		});
-
-		// Create tag suggestions container
-		const tagSuggestions = tagInputContainer.createEl('div', { cls: 'tag-suggestions' });
-
-		// Handle input event, show matching tags
-		tagInput.oninput = () => {
-			const value = tagInput.value.toLowerCase();
-			tagSuggestions.empty();
-
-			if (value) {
-				const matches = this.tags
-					.filter(tag => 
-						tag.name.toLowerCase().includes(value) && 
-						!selectedTags.has(tag.name)
-					)
-					.slice(0, 10);
-
-				if (matches.length > 0) {
-					// Get input box position and width
-					const inputRect = tagInput.getBoundingClientRect();
-					const modalRect = this.modalEl.getBoundingClientRect();
-					
-					// Ensure suggestions list doesn't exceed modal width
-					const maxWidth = modalRect.right - inputRect.left - 24; // 24px is right padding
-					
-					// Set suggestions list position and width
-					tagSuggestions.style.top = `${inputRect.bottom + 4}px`;
-					tagSuggestions.style.left = `${inputRect.left}px`;
-					tagSuggestions.style.width = `${Math.min(inputRect.width, maxWidth)}px`;
-
-					matches.forEach(tag => {
-						const suggestion = tagSuggestions.createEl('div', {
-							cls: 'tag-suggestion',
-							text: tag.name
-						});
-						suggestion.onclick = () => {
-							selectedTags.add(tag.name);
-							tagInput.value = '';
-							tagSuggestions.empty();
-							updateSelectedTags();
-						};
-					});
-				}
-			}
-		};
-
-		// Handle enter event
-		tagInput.onkeydown = (e) => {
-			if (e.key === 'Enter' && tagInput.value) {
-				e.preventDefault();
-				const value = tagInput.value.trim();
-				if (value && !selectedTags.has(value)) {
-					const existingTag = this.tags.find(t => t.name.toLowerCase() === value.toLowerCase());
-					if (existingTag) {
-						selectedTags.add(existingTag.name);
-						updateSelectedTags();
-					} else if (this.canCreateTags) {
-						selectedTags.add(value);
-						updateSelectedTags();
-					} else {
-						// Show permission notice
-						const notice = contentEl.createEl('div', {
-							cls: 'tag-notice',
-							text: t('PERMISSION_ERROR')
-						});
-						setTimeout(() => {
-							notice.remove();
-						}, 2000);
-					}
-				}
-				tagInput.value = '';
-				tagSuggestions.empty();
-			}
-		};
-
-		// Handle blur event, hide suggestions
-		tagInput.onblur = () => {
-			// Delay hide, so suggestions can be clicked
-			setTimeout(() => {
-				tagSuggestions.empty();
-			}, 200);
-		};
-
-		// Handle window scroll, update suggestions list position
-		const updateSuggestionsPosition = () => {
-			if (tagSuggestions.childNodes.length > 0) {
-				const inputRect = tagInput.getBoundingClientRect();
-				tagSuggestions.style.top = `${inputRect.bottom + 4}px`;
-				tagSuggestions.style.left = `${inputRect.left}px`;
-				tagSuggestions.style.width = `${inputRect.width}px`;
-			}
-		};
-
-		// Listen for scroll event
-		this.modalEl.addEventListener('scroll', updateSuggestionsPosition);
-		
-		// Remove event listeners when modal closes
-		this.modalEl.onclose = () => {
-			this.modalEl.removeEventListener('scroll', updateSuggestionsPosition);
-		};
-
-		// Create button area
-		const buttonArea = contentEl.createEl('div', { cls: 'button-area' });
-		const submitButton = buttonArea.createEl('button', { 
-			text: isUpdate ? t('UPDATE') : t('PUBLISH'),
-			cls: 'submit-button'
-		});
-
-		// Create notice container
-		const noticeContainer = buttonArea.createEl('div');
-		
-		submitButton.onclick = async () => {
-			if (!isUpdate) {
-				const selectEl = contentEl.querySelector('select') as HTMLSelectElement;
-				if (!selectEl) {
-					return;
-				}
-				const selectedCategoryId = selectEl.value;
-				this.plugin.settings.category = parseInt(selectedCategoryId);
-				await this.plugin.saveSettings();
-			}
-			
-			// Save selected tags
-			this.plugin.settings.selectedTags = Array.from(selectedTags);
-			await this.plugin.saveSettings();
-			
-			// Disable submit button, show loading state
-			submitButton.disabled = true;
-			submitButton.textContent = isUpdate ? t('UPDATING') : t('PUBLISHING');
-			
-			try {
-				const reply = await this.plugin.postTopic();
-				
-				// Show notice
-				noticeContainer.empty();
-				if (reply.message === 'Success') {
-					noticeContainer.createEl('div', { 
-						cls: 'notice success',
-						text: isUpdate ? t('UPDATE_SUCCESS') : t('PUBLISH_SUCCESS')
-					});
-					// Close after success
-					setTimeout(() => {
-						this.close();
-					}, 1500);
-				} else {
-					const errorContainer = noticeContainer.createEl('div', { cls: 'notice error' });
-					errorContainer.createEl('div', { 
-						cls: 'error-title',
-						text: isUpdate ? t('UPDATE_ERROR') : t('PUBLISH_ERROR')
-					});
-					
-					// Show Discourse-specific error information
-					errorContainer.createEl('div', { 
-						cls: 'error-message',
-						text: reply.error || (isUpdate ? t('UPDATE_FAILED') + ', ' + t('TRY_AGAIN') : t('PUBLISH_FAILED') + ', ' + t('TRY_AGAIN'))
-					});
-					
-					// Add retry button
-					const retryButton = errorContainer.createEl('button', {
-						cls: 'retry-button',
-						text: t('RETRY')
-					});
-					retryButton.onclick = () => {
-						noticeContainer.empty();
-						submitButton.disabled = false;
-						submitButton.textContent = isUpdate ? t('UPDATE') : t('PUBLISH');
-					};
-				}
-			} catch (error) {
-				noticeContainer.empty();
-				const errorContainer = noticeContainer.createEl('div', { cls: 'notice error' });
-				errorContainer.createEl('div', { 
-					cls: 'error-title',
-					text: isUpdate ? t('UPDATE_ERROR') : t('PUBLISH_ERROR')
-				});
-				errorContainer.createEl('div', { 
-					cls: 'error-message',
-					text: error.message || t('UNKNOWN_ERROR')
-				});
-				
-				// Add retry button
-				const retryButton = errorContainer.createEl('button', {
-					cls: 'retry-button',
-					text: t('RETRY')
-				});
-				retryButton.onclick = () => {
-					noticeContainer.empty();
-					submitButton.disabled = false;
-					submitButton.textContent = isUpdate ? t('UPDATE') : t('PUBLISH');
-				};
-			}
-			
-			// If error occurs, reset button state
-			if (submitButton.disabled) {
-				submitButton.disabled = false;
-				submitButton.textContent = isUpdate ? t('UPDATE') : t('PUBLISH');
-			}
-		};
-	}
-
-	onClose() {
-		const { contentEl } = this;
-		contentEl.empty();
-	}
-}

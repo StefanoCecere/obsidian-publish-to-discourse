@@ -6,6 +6,13 @@ export default {
     'API_KEY_DESC': "API key created in '/admin/api/keys'",
     'USERNAME': 'Username',
     'USERNAME_DESC': 'Your Discourse username',
+    'SKIP_H1': 'Skip First Heading',
+    'SKIP_H1_DESC': 'Skip the first heading (H1) when publishing to Discourse',
+    'TEST_API_KEY': 'Test Connection',
+    'TESTING': 'Testing...',
+    'API_TEST_SUCCESS': 'Connection successful! API key is valid',
+    'API_TEST_FAILED': 'API key test failed',
+    'MISSING_CREDENTIALS': 'Please fill in Forum URL, API Key and Username first',
 
     // Publish page
     'PUBLISH_TO_DISCOURSE': 'Publish to Discourse',
@@ -34,4 +41,9 @@ export default {
     'TRY_AGAIN': 'Please try again',
     'POST_ID_ERROR': 'Published successfully but failed to get post ID',
     'SAVE_POST_ID_ERROR': 'Published successfully but failed to save post ID',
+
+    // Open in Discourse
+    'OPEN_IN_DISCOURSE': 'Open in Discourse',
+    'NO_ACTIVE_FILE': 'No active file',
+    'NO_TOPIC_ID': 'This note has not been published to Discourse yet'
 } 

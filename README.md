@@ -28,3 +28,23 @@
 > 更新的前提是帖子本身是通过obsidian发布的.
 
 ![动图](./pics/20250124-001000.gif)
+
+## 在discourse中打开
+
+在笔记页面, 使用(Ctrl/Cmd + P)打开discourse的帖子.
+
+![image](https://github.com/user-attachments/assets/f729f2a0-042e-4691-b00b-1fc96514cc34)
+
+![image](https://github.com/user-attachments/assets/c710ad08-7636-4a69-a6cf-1d4496fa623d)
+
+当然, 我可以帮你优化这段表达, 并提供中英文对照版本。以下是优化后的内容:
+
+---
+
+## 赞助 / Sponsorship
+
+如果这个插件对你有帮助, 欢迎请我喝杯咖啡。当然, 只要使用就是对我最大的支持。
+
+If this plugin has been helpful to you, feel free to buy me a coffee. Of course, using it is the greatest support you can give me.
+
+链接 / Link: https://wise.com/pay/business/czlltd
